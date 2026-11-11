@@ -1,30 +1,20 @@
-## Installation & deployment tips 
-1. You need to configure your node to utilize GPU. In order this can be done the following way: 
-    * Install [nvidia-docker2](https://github.com/NVIDIA/nvidia-docker)
-    * Connect to your MasterNode and set nvidia as the default run in `/etc/docker/daemon.json`:
-        ```
-        {
-            "default-runtime": "nvidia",
-            "runtimes": {
-                "nvidia": {
-                    "path": "/usr/bin/nvidia-container-runtime",
-                    "runtimeArgs": []
-                }
-            }
-        }
-        ```
-    * After that deploy nvidia-daemon to kubernetes: 
-        ```bash
-        kubectl create -f https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v1.11/nvidia-device-plugin.yml
-        ```
-        
-2. NVIDIA GPUs can now be consumed via container level resource requirements using the resource name nvidia.com/gpu:
-      ```
-      resources:
-        limits:
-            nvidia.com/gpu: 2 # requesting 2 GPUs
-      ```
+# PyTorch Examples
 
-3. Building image. Each example has prebuilt images that are stored on google cloud resources (GCR). If you want to create your own image we recommend using dockerhub. Each example has its own Dockerfile that we strongly advise to use. To build your custom image follow instruction on [TechRepublic](https://www.techrepublic.com/article/how-to-create-a-docker-image-and-push-it-to-docker-hub/).
+This directory contains examples for training PyTorch models using the Kubeflow Trainer SDK.
 
-4. To deploy your job we recommend using official [kubeflow documentation](https://www.kubeflow.org/docs/guides/components/pytorch/). Each example has example yaml files for two versions of apis. Feel free to modify them, e.g. image or number of GPUs.
+## Examples
+
+| Task | Model | Dataset | Notebook |
+| :--- | :--- | :--- | :--- |
+| Image Classification | CNN | Fashion MNIST | [mnist.ipynb](./image-classification/mnist.ipynb) |
+| Question Answering | DistilBERT | SQuAD | [fine-tune-distilbert.ipynb](./question-answering/fine-tune-distilbert.ipynb) |
+| Speech Recognition | Transformer | Speech Commands | [speech-recognition.ipynb](./speech-recognition/speech-recognition.ipynb) |
+| Audio Classification | CNN (M5) | GTZAN | [audio-classification.ipynb](./audio-classification/audio-classification.ipynb) |
+| Data Caching | [Model] | [Dataset] | [data-cache-example.ipynb](./data-cache/data-cache-example.ipynb) |
+
+## Prerequisites
+
+To run these examples, install the Kubeflow SDK:
+```bash
+pip install -U kubeflow
+```

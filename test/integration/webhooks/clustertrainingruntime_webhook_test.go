@@ -1,0 +1,187 @@
+/*
+Copyright 2025 The Kubeflow Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package webhooks
+
+import (
+	"strings"
+
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+	"github.com/kubeflow/trainer/v2/pkg/constants"
+	testingutil "github.com/kubeflow/trainer/v2/pkg/util/testing"
+	"github.com/kubeflow/trainer/v2/test/integration/framework"
+)
+
+const clTrainingRuntimeName = "test-clustertrainingruntime"
+
+var _ = ginkgo.Describe("ClusterTrainingRuntime Webhook", ginkgo.Ordered, func() {
+	var ns *corev1.Namespace
+
+	ginkgo.BeforeAll(func() {
+		fwk = &framework.Framework{}
+		cfg = fwk.Init()
+		ctx, k8sClient = fwk.RunManager(cfg, false)
+	})
+	ginkgo.AfterAll(func() {
+		fwk.Teardown()
+	})
+
+	ginkgo.BeforeEach(func() {
+		ns = &corev1.Namespace{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: corev1.SchemeGroupVersion.String(),
+				Kind:       "Namespace",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "clustertrainingruntime-webhook-",
+			},
+		}
+		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+	})
+
+	ginkgo.AfterEach(func() {
+		gomega.Expect(k8sClient.DeleteAllOf(ctx, &trainer.ClusterTrainingRuntime{})).To(gomega.Succeed())
+	})
+
+	ginkgo.When("Creating ClusterTrainingRuntime", func() {
+		ginkgo.DescribeTable("", func(runtime func() *trainer.ClusterTrainingRuntime, errorMatcher gomega.OmegaMatcher) {
+			gomega.Expect(k8sClient.Create(ctx, runtime())).Should(errorMatcher)
+		},
+			ginkgo.Entry("Should succeed to create ClusterTrainingRuntime",
+				func() *trainer.ClusterTrainingRuntime {
+					baseRuntime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName)
+					return baseRuntime.
+						RuntimeSpec(
+							testingutil.MakeTrainingRuntimeSpecWrapper(baseRuntime.Spec).
+								Obj()).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to create ClusterTrainingRuntime with a negative coscheduling timeout",
+				func() *trainer.ClusterTrainingRuntime {
+					baseRuntime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName)
+					return baseRuntime.
+						RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(baseRuntime.Spec).
+							PodGroupPolicyCoschedulingSchedulingTimeout(-1).
+							Obj()).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should succeed to create ClusterTrainingRuntime with a zero coscheduling timeout",
+				func() *trainer.ClusterTrainingRuntime {
+					baseRuntime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName)
+					return baseRuntime.
+						RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(baseRuntime.Spec).
+							PodGroupPolicyCoschedulingSchedulingTimeout(0).
+							Obj()).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should succeed to create ClusterTrainingRuntime with a positive coscheduling timeout",
+				func() *trainer.ClusterTrainingRuntime {
+					baseRuntime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName)
+					return baseRuntime.
+						RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(baseRuntime.Spec).
+							PodGroupPolicyCoschedulingSchedulingTimeout(60).
+							Obj()).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should succeed to create ClusterTrainingRuntime with only volcano podGroupPolicy",
+				func() *trainer.ClusterTrainingRuntime {
+					baseRuntime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName)
+					return baseRuntime.
+						RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(baseRuntime.Spec).
+							PodGroupPolicyVolcano(&trainer.VolcanoPodGroupPolicySource{}).
+							Obj()).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to create ClusterTrainingRuntime with both coscheduling and volcano podGroupPolicy",
+				func() *trainer.ClusterTrainingRuntime {
+					baseRuntime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName)
+					return baseRuntime.
+						RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(baseRuntime.Spec).
+							PodGroupPolicyCoschedulingSchedulingTimeout(60).
+							PodGroupPolicyVolcano(&trainer.VolcanoPodGroupPolicySource{}).
+							Obj()).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Rejects creating a ClusterTrainingRuntime with a container resources.claim that does not exist in the pod resourceClaims",
+				func() *trainer.ClusterTrainingRuntime {
+					baseRuntime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName)
+					return baseRuntime.
+						RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(baseRuntime.Spec).
+							ContainerResourceClaims(constants.Node, constants.Node, corev1.ResourceClaim{Name: "gpu"}).
+							Obj()).
+						Obj()
+				},
+				gomega.MatchError(gomega.ContainSubstring("references resourceClaim \"gpu\" which is not defined in the Pod's resourceClaims"))),
+			ginkgo.Entry("Should succeed to create ClusterTrainingRuntime with a 20 characters replicatedJob name",
+				func() *trainer.ClusterTrainingRuntime {
+					runtime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName).Obj()
+					runtime.Spec.Template.Spec.ReplicatedJobs[0].Name = strings.Repeat("a", 20)
+					return runtime
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to create ClusterTrainingRuntime with a replicatedJob name longer than 20 characters",
+				func() *trainer.ClusterTrainingRuntime {
+					runtime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName).Obj()
+					runtime.Spec.Template.Spec.ReplicatedJobs[0].Name = strings.Repeat("a", 21)
+					return runtime
+				},
+				gomega.MatchError(gomega.ContainSubstring("replicatedJob name must be no more than 20 characters"))),
+			ginkgo.Entry("Should succeed to create ClusterTrainingRuntime with per-ReplicatedJob scheduling",
+				func() *trainer.ClusterTrainingRuntime {
+					baseRuntime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName)
+					return baseRuntime.
+						RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(baseRuntime.Spec).
+							Scheduling(&trainer.TrainingRuntimeScheduling{
+								ReplicatedJobs: []trainer.ReplicatedJobScheduling{
+									{
+										TargetReplicatedJobs: []string{constants.DatasetInitializer, constants.ModelInitializer},
+										SchedulingPolicy: &schedulingv1alpha3.WorkloadCompositePodGroupSchedulingPolicy{
+											Basic: &schedulingv1alpha3.WorkloadCompositePodGroupBasicSchedulingPolicy{},
+										},
+									},
+									{TargetReplicatedJobs: []string{constants.Node}},
+								},
+							}).
+							Obj()).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to create ClusterTrainingRuntime with both scheduling and podGroupPolicy",
+				func() *trainer.ClusterTrainingRuntime {
+					baseRuntime := testingutil.MakeClusterTrainingRuntimeWrapper(clTrainingRuntimeName)
+					return baseRuntime.
+						RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(baseRuntime.Spec).
+							Scheduling(&trainer.TrainingRuntimeScheduling{}).
+							PodGroupPolicyVolcano(&trainer.VolcanoPodGroupPolicySource{}).
+							Obj()).
+						Obj()
+				},
+				gomega.MatchError(gomega.ContainSubstring("scheduling and podGroupPolicy are mutually exclusive"))),
+		)
+	})
+})

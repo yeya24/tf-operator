@@ -1,0 +1,245 @@
+/*
+Copyright 2024 The Kubeflow Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package core
+
+import (
+	"context"
+	"errors"
+	"slices"
+
+	apiruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	configapi "github.com/kubeflow/trainer/v2/pkg/apis/config/v1alpha1"
+	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+	"github.com/kubeflow/trainer/v2/pkg/runtime"
+	"github.com/kubeflow/trainer/v2/pkg/runtime/framework"
+	fwkplugins "github.com/kubeflow/trainer/v2/pkg/runtime/framework/plugins"
+	index "github.com/kubeflow/trainer/v2/pkg/runtime/indexer"
+)
+
+var errorTooManyTrainJobStatusPlugin = errors.New("too many TrainJobStatus plugins are registered")
+
+type Framework struct {
+	registry                     fwkplugins.Registry
+	plugins                      map[string]framework.Plugin
+	enforceMLPlugins             []framework.EnforceMLPolicyPlugin
+	enforcePodGroupPolicyPlugins []framework.EnforcePodGroupPolicyPlugin
+	enforceSchedulingPlugins     []framework.EnforceSchedulingPlugin
+	enforcePodSpecPlugins        []framework.EnforcePodSpecPlugin
+	customValidationPlugins      []framework.CustomValidationPlugin
+	watchExtensionPlugins        []framework.WatchExtensionPlugin
+	preComponentBuilderPlugins   []framework.PreComponentBuilderPlugin
+	componentBuilderPlugins      []framework.ComponentBuilderPlugin
+	componentDeleterPlugins      []framework.ComponentDeleterPlugin
+	trainJobStatusPlugin         framework.TrainJobStatusPlugin
+}
+
+func New(ctx context.Context, c client.Client, r fwkplugins.Registry, indexer client.FieldIndexer, cfg *configapi.Configuration) (*Framework, error) {
+	f := &Framework{
+		registry: r,
+	}
+	plugins := make(map[string]framework.Plugin, len(r))
+	if err := f.SetupRuntimeClassIndexer(ctx, indexer); err != nil {
+		return nil, err
+	}
+
+	// Instantiate plugins in a deterministic order for consistency across restarts.
+	// The order is arbitrary.
+	names := make([]string, 0, len(r))
+	for name := range r {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+
+	for _, name := range names {
+		factory := r[name]
+		plugin, err := factory(ctx, c, indexer, cfg)
+		if err != nil {
+			return nil, err
+		}
+		plugins[name] = plugin
+		if p, ok := plugin.(framework.EnforceMLPolicyPlugin); ok {
+			f.enforceMLPlugins = append(f.enforceMLPlugins, p)
+		}
+		if p, ok := plugin.(framework.EnforcePodGroupPolicyPlugin); ok {
+			f.enforcePodGroupPolicyPlugins = append(f.enforcePodGroupPolicyPlugins, p)
+		}
+		if p, ok := plugin.(framework.EnforceSchedulingPlugin); ok {
+			f.enforceSchedulingPlugins = append(f.enforceSchedulingPlugins, p)
+		}
+		if p, ok := plugin.(framework.EnforcePodSpecPlugin); ok {
+			f.enforcePodSpecPlugins = append(f.enforcePodSpecPlugins, p)
+		}
+		if p, ok := plugin.(framework.CustomValidationPlugin); ok {
+			f.customValidationPlugins = append(f.customValidationPlugins, p)
+		}
+		if p, ok := plugin.(framework.WatchExtensionPlugin); ok {
+			f.watchExtensionPlugins = append(f.watchExtensionPlugins, p)
+		}
+		if p, ok := plugin.(framework.PreComponentBuilderPlugin); ok {
+			f.preComponentBuilderPlugins = append(f.preComponentBuilderPlugins, p)
+		}
+		if p, ok := plugin.(framework.ComponentBuilderPlugin); ok {
+			f.componentBuilderPlugins = append(f.componentBuilderPlugins, p)
+		}
+		if p, ok := plugin.(framework.ComponentDeleterPlugin); ok {
+			f.componentDeleterPlugins = append(f.componentDeleterPlugins, p)
+		}
+		if p, ok := plugin.(framework.TrainJobStatusPlugin); ok {
+			if f.trainJobStatusPlugin != nil {
+				return nil, errorTooManyTrainJobStatusPlugin
+			}
+			f.trainJobStatusPlugin = p
+		}
+	}
+	f.plugins = plugins
+	return f, nil
+}
+
+// RunEnforceMLPolicyPlugins configures the ML framework specific parameters declared in
+// the runtime `.spec.mlPolicy` on the Info object.
+func (f *Framework) RunEnforceMLPolicyPlugins(info *runtime.Info, trainJob *trainer.TrainJob) error {
+	for _, plugin := range f.enforceMLPlugins {
+		if err := plugin.EnforceMLPolicy(info, trainJob); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RunEnforcePodGroupPolicyPlugins configures the gang-scheduling parameters declared in
+// the runtime `.spec.podGroupPolicy` on the Info object. It must run after
+// RunEnforceMLPolicyPlugins, which can still adjust the PodSet counts.
+func (f *Framework) RunEnforcePodGroupPolicyPlugins(info *runtime.Info, trainJob *trainer.TrainJob) error {
+	for _, plugin := range f.enforcePodGroupPolicyPlugins {
+		if err := plugin.EnforcePodGroupPolicy(info, trainJob); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RunEnforceSchedulingPlugins configures the Workload-Aware Scheduling parameters declared in the
+// runtime `.spec.scheduling` on the Info object. It must run after RunEnforceMLPolicyPlugins, which
+// can still adjust the PodSet counts.
+func (f *Framework) RunEnforceSchedulingPlugins(info *runtime.Info, trainJob *trainer.TrainJob) error {
+	if info == nil {
+		return nil
+	}
+	for _, plugin := range f.enforceSchedulingPlugins {
+		if err := plugin.EnforceScheduling(info, trainJob); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RunEnforcePodSpecPlugins mutates the PodSpec of the Info PodSets.
+// It must run after RunEnforceMLPolicyPlugins and RunEnforcePodGroupPolicyPlugins.
+func (f *Framework) RunEnforcePodSpecPlugins(info *runtime.Info, trainJob *trainer.TrainJob) error {
+	if info == nil {
+		return nil
+	}
+	for _, plugin := range f.enforcePodSpecPlugins {
+		if err := plugin.EnforcePodSpec(info.TemplateSpec.PodSets, trainJob); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *Framework) RunCustomValidationPlugins(ctx context.Context, info *runtime.Info, oldObj, newObj *trainer.TrainJob) (admission.Warnings, field.ErrorList) {
+	var aggregatedWarnings admission.Warnings
+	var aggregatedErrors field.ErrorList
+	for _, plugin := range f.customValidationPlugins {
+		warnings, errs := plugin.Validate(ctx, info, oldObj, newObj)
+		if len(warnings) != 0 {
+			aggregatedWarnings = append(aggregatedWarnings, warnings...)
+		}
+		if errs != nil {
+			aggregatedErrors = append(aggregatedErrors, errs...)
+		}
+	}
+	return aggregatedWarnings, aggregatedErrors
+}
+
+// RunPreComponentBuilderPlugins consolidates the Info object with the concrete runtime
+// template. It must complete before RunComponentBuilderPlugins materializes any object.
+func (f *Framework) RunPreComponentBuilderPlugins(info *runtime.Info, trainJob *trainer.TrainJob) error {
+	for _, plugin := range f.preComponentBuilderPlugins {
+		if err := plugin.PreBuildSync(info, trainJob); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RunComponentBuilderPlugins materializes the Kubernetes objects for a TrainJob from the
+// consolidated Info object. It must run after RunPreComponentBuilderPlugins.
+func (f *Framework) RunComponentBuilderPlugins(ctx context.Context, info *runtime.Info, trainJob *trainer.TrainJob) ([]apiruntime.ApplyConfiguration, error) {
+	var objs []apiruntime.ApplyConfiguration
+	for _, plugin := range f.componentBuilderPlugins {
+		components, err := plugin.Build(ctx, info, trainJob)
+		if err != nil {
+			return nil, err
+		}
+		objs = append(objs, components...)
+	}
+	return objs, nil
+}
+
+// RunComponentDeleterPlugins aggregates the objects returned by all ComponentDeleterPlugins.
+// It performs no deletion itself.
+func (f *Framework) RunComponentDeleterPlugins(ctx context.Context, trainJob *trainer.TrainJob) ([]client.Object, error) {
+	var objs []client.Object
+	for _, plugin := range f.componentDeleterPlugins {
+		components, err := plugin.Delete(ctx, trainJob)
+		if err != nil {
+			return nil, err
+		}
+		objs = append(objs, components...)
+	}
+	return objs, nil
+}
+
+func (f *Framework) RunTrainJobStatusPlugin(ctx context.Context, trainJob *trainer.TrainJob) (*trainer.TrainJobStatus, error) {
+	if f.trainJobStatusPlugin != nil {
+		return f.trainJobStatusPlugin.Status(ctx, trainJob)
+	}
+	return nil, nil
+}
+
+func (f *Framework) WatchExtensionPlugins() []framework.WatchExtensionPlugin {
+	return f.watchExtensionPlugins
+}
+
+func (f *Framework) SetupRuntimeClassIndexer(ctx context.Context, indexer client.FieldIndexer) error {
+	if err := indexer.IndexField(ctx, &trainer.TrainingRuntime{},
+		index.TrainingRuntimeContainerRuntimeClassKey,
+		index.IndexTrainingRuntimeContainerRuntimeClass); err != nil {
+		return index.ErrorCanNotSetupTrainingRuntimeRuntimeClassIndexer
+	}
+	if err := indexer.IndexField(ctx, &trainer.ClusterTrainingRuntime{},
+		index.ClusterTrainingRuntimeContainerRuntimeClassKey,
+		index.IndexClusterTrainingRuntimeContainerRuntimeClass); err != nil {
+		return index.ErrorCanNotSetupClusterTrainingRuntimeRuntimeClassIndexer
+	}
+	return nil
+}

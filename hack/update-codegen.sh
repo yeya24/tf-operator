@@ -1,6 +1,6 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Copyright 2017 The Kubernetes Authors.
+# Copyright 2024 The Kubeflow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,136 +14,87 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This shell is used to auto generate some useful tools for k8s, such as lister,
-# informer, deepcopy, defaulter and so on.
-
-# Ignore shellcheck for IDEs
-# shellcheck disable=SC2116
-# shellcheck disable=SC2046
-# shellcheck disable=SC2006
+# This shell is used to auto generate some useful tools for k8s, such as clientset, lister, informer.
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-SCRIPT_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
-ROOT_PKG=github.com/kubeflow/tf-operator
+CURRENT_DIR=$(dirname "${BASH_SOURCE[0]}")
+TRAINER_ROOT=$(realpath "${CURRENT_DIR}/..")
+TRAINER_PKG="github.com/kubeflow/trainer/v2"
 
-# Grab code-generator version from go.sum
-CODEGEN_VERSION=$(grep 'k8s.io/code-generator' go.sum | awk '{print $2}' | sed 's/\/go.mod//g' | head -1)
-CODEGEN_PKG=$(echo `go env GOPATH`"/pkg/mod/k8s.io/code-generator@${CODEGEN_VERSION}")
+cd "$CURRENT_DIR/.."
 
-if [[ ! -d ${CODEGEN_PKG} ]]; then
-    echo "${CODEGEN_PKG} is missing. Running 'go mod download'."
-    go mod download
-fi
-
+# Get the code-generator binary.
+CODEGEN_PKG=$(go list -m -mod=readonly -f "{{.Dir}}" k8s.io/code-generator)
+source "${CODEGEN_PKG}/kube_codegen.sh"
 echo ">> Using ${CODEGEN_PKG}"
 
-# Grab openapi-gen version from go.mod
-OPENAPI_VERSION=$(grep 'k8s.io/kube-openapi' go.sum | awk '{print $2}' | sed 's/\/go.mod//g' | head -1)
-OPENAPI_PKG=$(echo `go env GOPATH`"/pkg/mod/k8s.io/kube-openapi@${OPENAPI_VERSION}")
+# Generating deepcopy and defaults.
+echo "Generating deepcopy and defaults for Kubeflow Trainer"
+kube::codegen::gen_helpers \
+  --boilerplate "${TRAINER_ROOT}/hack/boilerplate/boilerplate.go.txt" \
+  "${TRAINER_ROOT}/pkg/apis"
 
-if [[ ! -d ${OPENAPI_PKG} ]]; then
-    echo "${OPENAPI_PKG} is missing. Running 'go mod download'."
-    go mod download
-fi
+# Generate clients.
+externals=(
+  "sigs.k8s.io/jobset/api/jobset/v1alpha2.JobSetSpec:sigs.k8s.io/jobset/client-go/applyconfiguration/jobset/v1alpha2"
+  "k8s.io/api/core/v1.EnvVar:k8s.io/client-go/applyconfigurations/core/v1"
+  "k8s.io/api/core/v1.EnvFromSource:k8s.io/client-go/applyconfigurations/core/v1"
+  "k8s.io/api/core/v1.ResourceRequirements:k8s.io/client-go/applyconfigurations/core/v1"
+  "k8s.io/api/core/v1.Toleration:k8s.io/client-go/applyconfigurations/core/v1"
+  "k8s.io/api/core/v1.Volume:k8s.io/client-go/applyconfigurations/core/v1"
+  "k8s.io/api/core/v1.VolumeMount:k8s.io/client-go/applyconfigurations/core/v1"
+  "k8s.io/api/autoscaling/v2.MetricSpec:k8s.io/client-go/applyconfigurations/autoscaling/v2"
+  "volcano.sh/apis/pkg/apis/scheduling/v1beta1.NetworkTopologySpec:volcano.sh/apis/pkg/client/applyconfiguration/scheduling/v1beta1"
+)
 
+apply_config_externals="${externals[0]}"
+for external in "${externals[@]:1}"; do
+  apply_config_externals="${apply_config_externals},${external}"
+done
+
+echo "Generating clients for Kubeflow Trainer"
+kube::codegen::gen_client \
+  --boilerplate "${TRAINER_ROOT}/hack/boilerplate/boilerplate.go.txt" \
+  --output-dir "${TRAINER_ROOT}/pkg/client" \
+  --output-pkg "${TRAINER_PKG}/pkg/client" \
+  --with-watch \
+  --with-applyconfig \
+  --applyconfig-externals "${apply_config_externals}" \
+  "${TRAINER_ROOT}/pkg/apis"
+
+# Get the kube-openapi binary to generate OpenAPI spec.
+OPENAPI_PKG=$(go list -m -mod=readonly -f "{{.Dir}}" k8s.io/kube-openapi)
 echo ">> Using ${OPENAPI_PKG}"
 
-# code-generator does work with go.mod but makes assumptions about
-# the project living in `$GOPATH/src`. To work around this and support
-# any location; create a temporary directory, use this as an output
-# base, and copy everything back once generated.
-TEMP_DIR=$(mktemp -d)
-cleanup() {
-    echo ">> Removing ${TEMP_DIR}"
-    rm -rf ${TEMP_DIR}
-}
-trap "cleanup" EXIT SIGINT
+echo "Generating OpenAPI specification for Kubeflow Trainer"
 
-echo ">> Temporary output directory ${TEMP_DIR}"
+# This list needs to cover all of the types used transitively from the Kubeflow Trainer APIs.
+# Update this list if Kubeflow Trainer depends on new external APIs.
+EXTRA_PACKAGES=(
+  k8s.io/apimachinery/pkg/apis/meta/v1
+  k8s.io/apimachinery/pkg/api/resource
+  k8s.io/apimachinery/pkg/runtime
+  k8s.io/apimachinery/pkg/util/intstr
+  k8s.io/api/core/v1
+  k8s.io/api/autoscaling/v2
+  k8s.io/api/batch/v1
+  k8s.io/api/scheduling/v1alpha3
+  sigs.k8s.io/jobset/api/jobset/v1alpha2
+  volcano.sh/apis/pkg/apis/scheduling/v1beta1
+)
 
-# Ensure we can execute.
-chmod +x ${CODEGEN_PKG}/generate-groups.sh
+go run ${OPENAPI_PKG}/cmd/openapi-gen \
+  --go-header-file "${TRAINER_ROOT}/hack/boilerplate/boilerplate.go.txt" \
+  --output-pkg "${TRAINER_PKG}/pkg/apis/trainer/v1alpha1" \
+  --output-dir "${TRAINER_ROOT}/pkg/apis/trainer/v1alpha1" \
+  --output-file "zz_generated.openapi.go" \
+  --report-filename "${TRAINER_ROOT}/hack/violation_exception_v1alpha1.list" \
+  "${EXTRA_PACKAGES[@]}" \
+  "${TRAINER_ROOT}/pkg/apis/trainer/v1alpha1"
 
-
-# generate the code with:
-# --output-base    because this script should also be able to run inside the vendor dir of
-#                  k8s.io/kubernetes. The output-base is needed for the generators to output into the vendor dir
-#                  instead of the $GOPATH directly. For normal projects this can be dropped.
-cd ${SCRIPT_ROOT}
-${CODEGEN_PKG}/generate-groups.sh "all" \
- github.com/kubeflow/tf-operator/pkg/client github.com/kubeflow/tf-operator/pkg/apis \
- tensorflow:v1 \
- --output-base "${TEMP_DIR}" \
- --go-header-file hack/boilerplate/boilerplate.go.txt
-
-# Notice: The code in code-generator does not generate defaulter by default.
-# We need to build binary from vendor cmd folder.
-#echo "Building defaulter-gen"
-#go build -o defaulter-gen ${CODEGEN_PKG}/cmd/defaulter-gen
-
-# ${GOPATH}/bin/defaulter-gen is automatically built from ${CODEGEN_PKG}/generate-groups.sh
-echo "Generating defaulters for tensorflow/v1"
-${GOPATH}/bin/defaulter-gen --input-dirs github.com/kubeflow/tf-operator/pkg/apis/tensorflow/v1 \
- -O zz_generated.defaults \
- --output-package github.com/kubeflow/tf-operator/pkg/apis/tensorflow/v1 \
- --go-header-file hack/boilerplate/boilerplate.go.txt "$@"
-
-echo "Generating defaulters for pytorch/v1"
-${GOPATH}/bin/defaulter-gen --input-dirs github.com/kubeflow/tf-operator/pkg/apis/pytorch/v1 \
- -O zz_generated.defaults \
- --output-package github.com/kubeflow/tf-operator/pkg/apis/pytorch/v1 \
- --go-header-file hack/boilerplate/boilerplate.go.txt "$@"
-
-echo "Generating defaulters for mxnet/v1"
-${GOPATH}/bin/defaulter-gen --input-dirs github.com/kubeflow/tf-operator/pkg/apis/mxnet/v1 \
- -O zz_generated.defaults \
- --output-package github.com/kubeflow/tf-operator/pkg/apis/mxnet/v1 \
- --go-header-file hack/boilerplate/boilerplate.go.txt "$@"
-
-echo "Generating defaulters for xgboost/v1"
-${GOPATH}/bin/defaulter-gen --input-dirs github.com/kubeflow/tf-operator/pkg/apis/xgboost/v1 \
- -O zz_generated.defaults \
- --output-package github.com/kubeflow/tf-operator/pkg/apis/xgboost/v1 \
- --go-header-file hack/boilerplate/boilerplate.go.txt "$@"
-
-cd - > /dev/null
-
-# Notice: The code in kube-openapi does not generate defaulter by default.
-# We need to build binary from pkg cmd folder.
-echo "Building openapi-gen"
-go build -o openapi-gen ${OPENAPI_PKG}/cmd/openapi-gen
-
-echo "Generating OpenAPI specification for tensorflow/v1"
-./openapi-gen --input-dirs github.com/kubeflow/tf-operator/pkg/apis/tensorflow/v1,github.com/kubeflow/common/pkg/apis/common/v1 \
- --report-filename=hack/violation_exception.list \
- --output-package github.com/kubeflow/tf-operator/pkg/apis/tensorflow/v1 \
- --go-header-file hack/boilerplate/boilerplate.go.txt "$@"
-
-echo "Generating OpenAPI specification for pytorch/v1"
-./openapi-gen --input-dirs github.com/kubeflow/tf-operator/pkg/apis/pytorch/v1,github.com/kubeflow/common/pkg/apis/common/v1 \
- --report-filename=hack/violation_exception.list \
- --output-package github.com/kubeflow/tf-operator/pkg/apis/pytorch/v1 \
- --go-header-file hack/boilerplate/boilerplate.go.txt "$@"
-
-echo "Generating OpenAPI specification for mxnet/v1"
-./openapi-gen --input-dirs github.com/kubeflow/tf-operator/pkg/apis/mxnet/v1,github.com/kubeflow/common/pkg/apis/common/v1 \
- --report-filename=hack/violation_exception.list \
- --output-package github.com/kubeflow/tf-operator/pkg/apis/mxnet/v1 \
- --go-header-file hack/boilerplate/boilerplate.go.txt "$@"
-
-echo "Generating OpenAPI specification for xgboost/v1"
-./openapi-gen --input-dirs github.com/kubeflow/tf-operator/pkg/apis/xgboost/v1,github.com/kubeflow/common/pkg/apis/common/v1 \
- --report-filename=hack/violation_exception.list \
- --output-package github.com/kubeflow/tf-operator/pkg/apis/xgboost/v1 \
- --go-header-file hack/boilerplate/boilerplate.go.txt "$@"
-
-cd - > /dev/null
-
-# Copy everything back.
-cp -a "${TEMP_DIR}/${ROOT_PKG}/." "${SCRIPT_ROOT}/"
-
-# Clean up binaries we build for update codegen
-rm ./openapi-gen
+# Generating OpenAPI Swagger for Kubeflow Trainer.
+echo "Generate OpenAPI Swagger for Kubeflow Trainer"
+go run hack/swagger/main.go >api/openapi-spec/swagger.json

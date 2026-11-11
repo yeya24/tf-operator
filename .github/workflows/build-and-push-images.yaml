@@ -1,0 +1,135 @@
+# Copyright The Kubeflow Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Build and Publish Images
+
+on:
+  push:
+    branches:
+      - master
+      - "release-*"
+    tags:
+      - "v*"
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'proposals/**'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: git ref (tag, branch, or SHA) to check out and build the images from
+        required: false
+        type: string
+        default: ""
+      version:
+        description: explicit image tag (e.g. v2.3.0-rc.0) to publish
+        required: false
+        type: string
+        default: ""
+      publish:
+        description: whether to push the built images to registries
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-and-publish:
+    name: Build and Publish Images
+    if: github.repository == 'kubeflow/trainer'
+    runs-on: cncf-ubuntu-16-64-x86
+
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      SHOULD_PUBLISH: ${{ inputs.publish || github.event_name == 'push' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component-name: trainer-controller-manager
+            dockerfile: cmd/trainer-controller-manager/Dockerfile
+            platforms: linux/amd64,linux/arm64,linux/ppc64le
+          - component-name: model-initializer
+            dockerfile: cmd/initializers/model/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - component-name: dataset-initializer
+            dockerfile: cmd/initializers/dataset/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - component-name: deepspeed-runtime
+            dockerfile: cmd/runtimes/deepspeed/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - component-name: xgboost-runtime
+            dockerfile: cmd/runtimes/xgboost/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          # TODO (andreyvelich): mlx[cuda] doesn't support arm at the moment: https://github.com/ml-explore/mlx/issues/2469
+          - component-name: mlx-runtime
+            dockerfile: cmd/runtimes/mlx/Dockerfile
+            platforms: linux/amd64
+          - component-name: torchtune-trainer
+            dockerfile: cmd/trainers/torchtune/Dockerfile
+            platforms: linux/amd64,linux/arm64
+          - component-name: data-cache
+            dockerfile: cmd/data_cache/Dockerfile
+            platforms: linux/amd64,linux/arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Checkout to the release tag when called from the release workflow.
+          ref: ${{ inputs.ref }}
+
+      - name: GHCR Login
+        if: env.SHOULD_PUBLISH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker Hub Login
+        if: env.SHOULD_PUBLISH == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish Component ${{ matrix.component-name }}
+        if: env.SHOULD_PUBLISH == 'true'
+        id: publish
+        uses: ./.github/workflows/template-publish-image
+        with:
+          image: |
+            ghcr.io/kubeflow/trainer/${{ matrix.component-name }}
+            docker.io/kubeflow/${{ matrix.component-name }}
+          dockerfile: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          version: ${{ inputs.version }}
+          push: true
+
+      - name: Test Build For Component ${{ matrix.component-name }}
+        if: env.SHOULD_PUBLISH != 'true'
+        uses: ./.github/workflows/template-publish-image
+        with:
+          image: |
+            ghcr.io/kubeflow/trainer/${{ matrix.component-name }}
+            docker.io/kubeflow/${{ matrix.component-name }}
+          dockerfile: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
+          version: ${{ inputs.version }}
+          push: false

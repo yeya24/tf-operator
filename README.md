@@ -1,109 +1,179 @@
-# Kubeflow Training Operator
+<div align="center">
 
-[![Build Status](https://travis-ci.org/kubeflow/tf-operator.svg?branch=master)](https://travis-ci.org/kubeflow/tf-operator)
-[![Coverage Status](https://coveralls.io/repos/github/kubeflow/tf-operator/badge.svg?branch=master)](https://coveralls.io/github/kubeflow/tf-operator?branch=master)
-[![Go Report Card](https://goreportcard.com/badge/github.com/kubeflow/tf-operator)](https://goreportcard.com/report/github.com/kubeflow/tf-operator)
+<p align="center">
+  <img src="./docs/images/trainer-logo.svg" alt="logo" width="200">
+</p>
+
+# Kubeflow Trainer
+
+**Distributed AI Platform on Kubernetes.**
+
+[![Release](https://img.shields.io/github/v/release/kubeflow/trainer)](https://github.com/kubeflow/trainer/releases)
+[![Join Slack](https://img.shields.io/badge/Join_Slack-blue?logo=slack)](https://www.kubeflow.org/docs/about/community/#kubeflow-slack-channels)
+[![Coverage Status](https://coveralls.io/repos/github/kubeflow/trainer/badge.svg?branch=master)](https://coveralls.io/github/kubeflow/trainer?branch=master)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/10435/badge)](https://www.bestpractices.dev/projects/10435)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fkubeflow%2Ftrainer.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2Fkubeflow%2Ftrainer?ref=badge_shield)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kubeflow/trainer)
+
+</div>
+
+Latest News 🔥
+
+- [2026/11] Kubeflow Trainer v2.4.0 is here, bringing Workload-Aware Scheduling, OptimizationJob, and
+  Dynamic Resource Allocation to the Trainer project. Check out
+  [the blog post announcement](https://blog.kubeflow.org/kubeflow-trainer-v2.4-release/)
+- [2026/08] Kubeflow Trainer v2.3.0 is officially released with the runtime snapshot mechanism for
+  decoupled runtime lifecycle, enhanced MPI support, and proposal Megatron-LM examples. Check out
+  [the GitHub release notes](https://github.com/kubeflow/trainer/releases/tag/v2.3.0).
+- [2026/03] Kubeflow Trainer v2.2 is officially released with support for JAX and XGBoost
+  Training Runtimes, enhanced observability with metrics propagation to TrainJob status,
+  and Flux Framework integration for HPC and MPI workloads. Check out
+  [the blog post announcement](https://blog.kubeflow.org/kubeflow-trainer-v2.2-release/).
+- [2025/11] Kubeflow Trainer v2.1 is officially released with support of
+  [Distributed Data Cache](https://trainer.kubeflow.org/en/latest/user-guides/data-cache.html),
+  topology aware scheduling with Kueue and Volcano, and LLM post-training enhancements. Check out
+  [the GitHub release notes](https://github.com/kubeflow/trainer/releases/tag/v2.1.0).
+
+<details>
+<summary>More</summary>
+
+- [2025/09] Kubeflow SDK v0.1 is officially released with support for CustomTrainer,
+  BuiltinTrainer, and local PyTorch execution. Check out
+  [the GitHub release notes](https://github.com/kubeflow/sdk/releases/tag/0.1.0).
+- [2025/07] PyTorch on Kubernetes: Kubeflow Trainer Joins the PyTorch Ecosystem. Find the
+  announcement in [the PyTorch blog post](https://pytorch.org/blog/pytorch-on-kubernetes-kubeflow-trainer-joins-the-pytorch-ecosystem/).
+- [2025/07] Kubeflow Trainer v2.0 has been officially released. Check out
+  [the blog post announcement](https://blog.kubeflow.org/trainer/intro/) and [the
+  release notes](https://github.com/kubeflow/trainer/releases/tag/v2.0.0).
+- [2025/04] From High Performance Computing To AI Workloads on Kubernetes: MPI Runtime in
+  Kubeflow TrainJob. See the [KubeCon + CloudNativeCon London talk](https://youtu.be/Fnb1a5Kaxgo)
+
+</details>
 
 ## Overview
 
-Starting from v1.3, this training operator provides Kubernetes custom resources that makes it easy to
-run distributed or non-distributed TensorFlow/PyTorch/MXNet/XGBoost jobs on Kubernetes.
+<!-- overview-start -->
 
-> Note: Before v1.2 release, Kubeflow Training Operator only supports TFJob on Kubernetes.
+Kubeflow Trainer is a Kubernetes-native distributed AI platform for scalable large language model
+(LLM) fine-tuning, hyperparameter optimization, and training of AI models across a wide range of frameworks,
+including PyTorch, MLX, HuggingFace, DeepSpeed, Megatron-LM, JAX, XGBoost, and more.
 
-- For a complete reference of the custom resource definitions, please refer to the API Definition.
-  - [Tensorflow API Definition](pkg/apis/tensorflow/v1/types.go)
-  - [PyTorch API Definition](pkg/apis/pytorch/v1/pytorchjob_types.go)
-  - [MXNet API Definition](pkg/apis/mxnet/v1/mxjob_types.go)
-  - [XGBoost API Definition](pkg/apis/xgboost/v1/xgboostjob_types.go)
-- For details on API design, please refer to the [v1alpha2 design doc](https://github.com/kubeflow/community/blob/master/proposals/tf-operator-design-v1alpha2.md).
-- For details of all-in-one operator design, please refer to the [All-in-one Kubeflow Training Operator](https://docs.google.com/document/d/1x1JPDQfDMIbnoQRftDH1IzGU0qvHGSU4W6Jl4rJLPhI/edit#heading=h.e33ufidnl8z6)
-- For details on its obersibility, please refer to the [monitoring design doc](docs/monitoring/README.md).
+Kubeflow Trainer brings MPI to Kubernetes, orchestrating multi-node, multi-GPU distributed
+jobs efficiently across high-performance computing (HPC) clusters. This enables high-throughput
+communication between processes, making it ideal for large-scale AI training that requires
+ultra-fast synchronization between GPUs nodes.
 
-## Prerequisites
+Kubeflow Trainer seamlessly integrates with the Cloud Native AI ecosystem, including
+[Kueue](https://kueue.sigs.k8s.io/docs/tasks/run/trainjobs/) for topology-aware scheduling and
+multi-cluster job dispatching, [Slurm Bridge](https://github.com/SlinkyProject/slurm-bridge) for
+scheduling on hybrid Kubernetes and Slurm clusters, and [KAI Scheduler](https://github.com/NVIDIA/KAI-Scheduler) for
+GPU aware scheduling.
 
-* Version >= 1.16 of Kubernetes
-* Version >= 3.x of Kustomize
-* Version >= 1.21.x of Kubectl
+Kubeflow Trainer reuses existing Kubernetes-native building blocks like
+[JobSet](https://github.com/kubernetes-sigs/jobset) and [LeaderWorkerSet](https://github.com/kubernetes-sigs/lws)
+for AI workload orchestration.
 
-## Installation
+Kubeflow Trainer provides a distributed data cache designed to stream large-scale data with zero-copy
+transfer directly to GPU nodes. This ensures memory-efficient training jobs while maximizing
+GPU utilization.
 
-### Master Branch
+With [the Kubeflow Python SDK](https://github.com/kubeflow/sdk), AI practitioners can effortlessly
+develop and fine-tune LLMs while leveraging the Kubeflow Trainer APIs: TrainJob and Runtimes.
+
+<!-- overview-end -->
+
+<h1 align="center">
+    <img src="./docs/images/trainer-overview.drawio.png" alt="logo" width="900">
+  <br>
+</h1>
+
+## Kubeflow Trainer Introduction
+
+Checkout following KubeCon + CloudNativeCon talks for Kubeflow Trainer capabilities:
+
+[![Kubeflow Trainer](https://img.youtube.com/vi/Lgy4ir1AhYw/0.jpg)](https://www.youtube.com/watch?v=Lgy4ir1AhYw)
+
+Additional talks:
+
+- [From High Performance Computing To AI Workloads on Kubernetes: MPI Runtime in Kubeflow TrainJob](https://youtu.be/Fnb1a5Kaxgo)
+- [Streamline LLM Fine-tuning on Kubernetes With Kubeflow LLM Trainer](https://youtu.be/O7cNlaz3Hqs)
+
+## Getting Started
+
+Please check [the official Kubeflow Trainer documentation](https://trainer.kubeflow.org/en/latest/getting-started/index.html)
+to install and get started with Kubeflow Trainer.
+
+To deploy the latest stable release run:
 
 ```bash
-kubectl apply -k "github.com/kubeflow/tf-operator/manifests/overlays/standalone"
+helm install kubeflow-trainer oci://ghcr.io/kubeflow/charts/kubeflow-trainer \
+    --namespace kubeflow-system \
+    --create-namespace \
+    --set runtimes.defaultEnabled=true
 ```
-
-### Stable Release
-
-```bash
-kubectl apply -k "github.com/kubeflow/tf-operator/manifests/overlays/standalone?ref=v1.3.0"
-```
-
-### Tensorflow Release Only
-
-For users who prefer to use original tensorflow controllers, please checkout v1.2-branch, we will maintain the bug fix in this branch.
-
-```bash
-kubectl apply -k "github.com/kubeflow/tf-operator/manifests/overlays/standalone?ref=v1.2.0"
-```
-
-### Python SDK for Kubeflow Training Operator
-
-Training Operator provides Python SDK for the custom resources. More docs are available in [sdk/python](sdk/python) folder.
-
-Use `pip install` command to install the latest release of the SDK:
-```
-pip install kubeflow-training
-```
-
-## Quick Start
-
-Please refer to the [quick-start-v1.md](docs/quick-start-v1.md) and [Kubeflow Training User Guide](https://www.kubeflow.org/docs/guides/components/tftraining/) for more information.
-
-## API Documentation
-
-Please refer to API Documentation.
-- [Tensorflow API Documentation](docs/api/tensorflow_generated.asciidoc)
-- [PyTorch API Documentation](docs/api/pytorch_generated.asciidoc)
-- [MXNet API Documentation](docs/api/mxnet_generated.asciidoc)
-- [XGBoost API Documentation](docs/api/xgboost_generated.asciidoc)
 
 ## Community
 
-You can:
+<!-- community-start -->
 
-- Join our [Slack](https://join.slack.com/t/kubeflow/shared_invite/zt-n73pfj05-l206djXlXk5qdQKs4o1Zkg) channel.
-- Check out [who is using this operator](./docs/adopters.md).
+The following links provide information on how to get involved with the Kubeflow Trainer community:
 
-This is a part of Kubeflow, so please see [readme in kubeflow/kubeflow](https://github.com/kubeflow/kubeflow#get-involved) to get in touch with the community.
+- Join our [`#kubeflow-trainer` Slack channel](https://www.kubeflow.org/docs/about/community/#kubeflow-slack).
+- Attend [the bi-weekly Kubeflow Trainer and Katib call](https://bit.ly/kf-trainer-meeting).
+
+### Help Trainer Grow
+
+Sharing how you use and value Kubeflow Trainer helps keep the project well supported and growing:
+
+- **[Star Kubeflow Trainer](https://github.com/kubeflow/trainer)** on GitHub if you like the project.
+- **[Add your organization](https://github.com/kubeflow/trainer/edit/master/docs/community/adopters.yaml)**
+  to [the adopters directory](https://trainer.kubeflow.org/en/latest/community/adopters.html) if you
+  use Kubeflow Trainer, by submitting a pull request that edits the `adopters.yaml` file.
+- **[Share your experience](https://github.com/kubeflow/blog)** on [the Kubeflow blog](https://blog.kubeflow.org/)
+  by submitting a pull request with your story.
+
+### Star History
+
+<a href="https://www.star-history.com/?repos=kubeflow%2Ftrainer&type=date&legend=top-left">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=kubeflow/trainer&type=date&theme=dark&legend=top-left">
+    <img alt="Star history chart for kubeflow/trainer" src="https://api.star-history.com/svg?repos=kubeflow/trainer&type=date&legend=top-left">
+  </picture>
+</a>
+
+<!-- community-end -->
 
 ## Contributing
 
-Please refer to the [DEVELOPMENT](docs/development/developer_guide.md)
+Please refer to the [CONTRIBUTING guide](CONTRIBUTING.md).
 
+## Changelog
 
-## Change Log
+Please refer to the [CHANGELOG](CHANGELOG/) directory.
 
-Please refer to [CHANGELOG](CHANGELOG.md)
+## Kubeflow Training Operator V1
 
-## Version Matrix
+Kubeflow Trainer project is currently in <strong>alpha</strong> status, and APIs may change.
+If you are using Kubeflow Training Operator V1, please refer [to this migration document](https://trainer.kubeflow.org/en/latest/operator-guides/migration.html).
 
-The following table lists the most recent few versions of the operator.
+Kubeflow Community will maintain the Training Operator V1 source code at
+[the `release-1.9` branch](https://github.com/kubeflow/trainer/tree/release-1.9).
 
-| Operator Version | API Version | Kubernetes Version |
-| ------------- | ------------- | ------------- |
-| `v1.0.x`| `v1` | 1.16+ |
-| `v1.1.x`| `v1` | 1.16+ |
-| `v1.2.x`| `v1` | 1.16+ |
-| `v1.3.x`| `v1` | 1.18+ |
-| `latest` (master HEAD) | `v1` | 1.18+ |
+You can find the documentation for Kubeflow Training Operator V1 in [these guides](https://trainer.kubeflow.org/en/latest/legacy-v1/index.html).
 
 ## Acknowledgement
 
-This project was originally started as a distributed training operator for TensorFlow and later we merged efforts from other Kubeflow training operators to provide a unified and simplified experience for both users and developers. We are very grateful to all who filed issues or helped resolve them, asked and answered questions, and were part of inspiring discussions. We'd also like to thank everyone who's contributed to and maintained the original operators.
+This project was originally started as a distributed training operator for TensorFlow and later we
+merged efforts from other Kubeflow Training Operators to provide a unified and simplified experience
+for both users and developers. We are very grateful to all who filed issues or helped resolve them,
+asked and answered questions, and were part of inspiring discussions.
+We'd also like to thank everyone who's contributed to and maintained the original operators.
 
-* PyTorch Operator: [list of contributors](https://github.com/kubeflow/pytorch-operator/graphs/contributors) and [maintainers](https://github.com/kubeflow/pytorch-operator/blob/master/OWNERS).
-* MPI Operator: [list of contributors](https://github.com/kubeflow/mpi-operator/graphs/contributors) and [maintainers](https://github.com/kubeflow/mpi-operator/blob/master/OWNERS).
-* XGBoost Operator: [list of contributors](https://github.com/kubeflow/xgboost-operator/graphs/contributors) and [maintainers](https://github.com/kubeflow/xgboost-operator/blob/master/OWNERS).
-* MXNet Operator: [list of contributors](https://github.com/kubeflow/mxnet-operator/graphs/contributors) and [maintainers](https://github.com/kubeflow/mxnet-operator/blob/master/OWNERS).
+- PyTorch Operator: [list of contributors](https://github.com/kubeflow/pytorch-operator/graphs/contributors)
+  and [maintainers](https://github.com/kubeflow/pytorch-operator/blob/master/OWNERS).
+- MPI Operator: [list of contributors](https://github.com/kubeflow/mpi-operator/graphs/contributors)
+  and [maintainers](https://github.com/kubeflow/mpi-operator/blob/master/OWNERS).
+- XGBoost Operator: [list of contributors](https://github.com/kubeflow/xgboost-operator/graphs/contributors)
+  and [maintainers](https://github.com/kubeflow/xgboost-operator/blob/master/OWNERS).
+- Common library: [list of contributors](https://github.com/kubeflow/common/graphs/contributors) and
+  [maintainers](https://github.com/kubeflow/common/blob/master/OWNERS).

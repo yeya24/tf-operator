@@ -1,0 +1,1148 @@
+/*
+Copyright 2024 The Kubeflow Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package webhooks
+
+import (
+	"strings"
+
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	jobsetv1alpha2 "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+
+	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
+	"github.com/kubeflow/trainer/v2/pkg/constants"
+	testingutil "github.com/kubeflow/trainer/v2/pkg/util/testing"
+	"github.com/kubeflow/trainer/v2/test/integration/framework"
+	"github.com/kubeflow/trainer/v2/test/util"
+)
+
+var _ = ginkgo.Describe("TrainJob Webhook", ginkgo.Ordered, func() {
+	var ns *corev1.Namespace
+	var trainingRuntime *trainer.TrainingRuntime
+	var clusterTrainingRuntime *trainer.ClusterTrainingRuntime
+	runtimeName := "training-runtime"
+	jobName := "train-job"
+
+	ginkgo.BeforeAll(func() {
+		fwk = &framework.Framework{}
+		cfg = fwk.Init()
+		ctx, k8sClient = fwk.RunManager(cfg, false)
+	})
+	ginkgo.AfterAll(func() {
+		fwk.Teardown()
+	})
+
+	ginkgo.BeforeEach(func() {
+		ns = &corev1.Namespace{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: corev1.SchemeGroupVersion.String(),
+				Kind:       "Namespace",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "trainjob-webhook-",
+			},
+		}
+		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+
+		baseRuntimeWrapper := testingutil.MakeTrainingRuntimeWrapper(ns.Name, runtimeName)
+		baseClusterRuntimeWrapper := testingutil.MakeClusterTrainingRuntimeWrapper(runtimeName)
+		trainingRuntime = baseRuntimeWrapper.RuntimeSpec(
+			testingutil.MakeTrainingRuntimeSpecWrapper(
+				testingutil.MakeTrainingRuntimeWrapper(ns.Name, runtimeName).Spec).Obj()).Obj()
+		clusterTrainingRuntime = baseClusterRuntimeWrapper.RuntimeSpec(
+			testingutil.MakeTrainingRuntimeSpecWrapper(
+				testingutil.MakeClusterTrainingRuntimeWrapper(runtimeName).Spec).Obj()).Obj()
+		gomega.Expect(k8sClient.Create(ctx, trainingRuntime)).To(gomega.Succeed())
+		gomega.Expect(k8sClient.Create(ctx, clusterTrainingRuntime)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(trainingRuntime), trainingRuntime)).Should(gomega.Succeed())
+		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(clusterTrainingRuntime), clusterTrainingRuntime)).Should(gomega.Succeed())
+		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	})
+
+	ginkgo.AfterEach(func() {
+		gomega.Expect(k8sClient.DeleteAllOf(ctx, &trainer.TrainJob{}, client.InNamespace(ns.Name))).To(gomega.Succeed())
+		gomega.Expect(k8sClient.DeleteAllOf(ctx, &trainer.TrainingRuntime{}, client.InNamespace(ns.Name))).To(gomega.Succeed())
+		gomega.Expect(k8sClient.DeleteAllOf(ctx, &trainer.ClusterTrainingRuntime{})).To(gomega.Succeed())
+	})
+
+	ginkgo.When("Creating TrainJob", func() {
+		ginkgo.DescribeTable("Validate TrainJob on creation", func(trainJob func() *trainer.TrainJob, errorMatcher gomega.OmegaMatcher) {
+			gomega.Expect(k8sClient.Create(ctx, trainJob())).Should(errorMatcher)
+		},
+			ginkgo.Entry("Should succeed in creating trainJob with namespace scoped trainingRuntime",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), runtimeName).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail in creating trainJob referencing trainingRuntime not present in the namespace",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "invalid").
+						Obj()
+				},
+				testingutil.BeForbiddenError()),
+			ginkgo.Entry("Should fail in creating trainJob with negative numNodes",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), runtimeName).
+						Trainer(testingutil.MakeTrainJobTrainerWrapper().
+							NumNodes(-1).
+							Obj()).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should succeed in creating trainJob with zero numNodes",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), runtimeName).
+						Trainer(testingutil.MakeTrainJobTrainerWrapper().
+							NumNodes(0).
+							Obj()).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail in creating trainJob with negative numProcPerNode",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), runtimeName).
+						Trainer(testingutil.MakeTrainJobTrainerWrapper().
+							NumProcPerNode(-5).
+							Obj()).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should fail in creating trainJob with zero numProcPerNode",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), runtimeName).
+						Trainer(testingutil.MakeTrainJobTrainerWrapper().
+							NumProcPerNode(0).
+							Obj()).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should succeed in creating trainJob with positive numNodes and numProcPerNode",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), runtimeName).
+						Trainer(testingutil.MakeTrainJobTrainerWrapper().
+							NumNodes(1).
+							NumProcPerNode(1).
+							Obj()).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should succeed in creating trainJob with cluster scoped ClusterTrainingRuntime",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail in creating trainJob with pre-trained model config when referencing a trainingRuntime without an initializer",
+				func() *trainer.TrainJob {
+					// remove model initializer from runtime
+					var replicatedJobs []jobsetv1alpha2.ReplicatedJob
+					for _, rj := range trainingRuntime.Spec.Template.Spec.ReplicatedJobs {
+						labels := rj.Template.Labels
+						if v := labels[constants.LabelTrainJobAncestor]; v != constants.ModelInitializer {
+							replicatedJobs = append(replicatedJobs, rj)
+						}
+					}
+					gomega.Expect(replicatedJobs).To(gomega.HaveLen(len(trainingRuntime.Spec.Template.Spec.ReplicatedJobs) - 1))
+					trainingRuntime.Spec.Template.Spec.ReplicatedJobs = replicatedJobs
+					gomega.Expect(k8sClient.Update(ctx, trainingRuntime)).To(gomega.Succeed())
+
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), runtimeName).
+						Initializer(
+							testingutil.MakeTrainJobInitializerWrapper().
+								ModelInitializer(
+									testingutil.MakeTrainJobModelInitializerWrapper().
+										StorageUri("hf://trainjob-model").
+										Obj(),
+								).
+								Obj(),
+						).
+						Obj()
+				},
+				testingutil.BeForbiddenError()),
+			ginkgo.Entry("Should fail in creating trainJob with dataset initializer when referencing a trainingRuntime without an initializer",
+				func() *trainer.TrainJob {
+					// remove dataset initializer from runtime
+					var replicatedJobs []jobsetv1alpha2.ReplicatedJob
+					for _, rj := range trainingRuntime.Spec.Template.Spec.ReplicatedJobs {
+						labels := rj.Template.Labels
+						if v := labels[constants.LabelTrainJobAncestor]; v != constants.DatasetInitializer {
+							replicatedJobs = append(replicatedJobs, rj)
+						}
+					}
+					gomega.Expect(replicatedJobs).To(gomega.HaveLen(len(trainingRuntime.Spec.Template.Spec.ReplicatedJobs) - 1))
+					trainingRuntime.Spec.Template.Spec.ReplicatedJobs = replicatedJobs
+					gomega.Expect(k8sClient.Update(ctx, trainingRuntime)).To(gomega.Succeed())
+
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), runtimeName).
+						Initializer(
+							testingutil.MakeTrainJobInitializerWrapper().
+								DatasetInitializer(
+									testingutil.MakeTrainJobDatasetInitializerWrapper().
+										StorageUri("hf://trainjob-model").
+										Obj(),
+								).
+								Obj(),
+						).
+						Obj()
+				},
+				testingutil.BeForbiddenError()),
+			ginkgo.Entry("Should succeed in creating trainJob with dataset initializer when referencing a ClusterTrainingRuntime with an initializer",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Initializer(
+							testingutil.MakeTrainJobInitializerWrapper().
+								DatasetInitializer(
+									testingutil.MakeTrainJobDatasetInitializerWrapper().
+										StorageUri("hf://trainjob-model").
+										Obj(),
+								).
+								Obj(),
+						).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should succeed in creating trainJob with valid trainer config for torch runtime",
+				func() *trainer.TrainJob {
+					trainingRuntime.Spec.MLPolicy = &trainer.MLPolicy{MLPolicySource: trainer.MLPolicySource{Torch: &trainer.TorchMLPolicySource{}}}
+					gomega.Expect(k8sClient.Update(ctx, trainingRuntime)).To(gomega.Succeed())
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), runtimeName).
+						Trainer(&trainer.Trainer{NumProcPerNode: ptr.To[int32](4)}).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail in creating trainJob with trainer config having envs with reserved env names",
+				func() *trainer.TrainJob {
+					trainingRuntime.Spec.MLPolicy = &trainer.MLPolicy{MLPolicySource: trainer.MLPolicySource{Torch: &trainer.TorchMLPolicySource{}}}
+					gomega.Expect(k8sClient.Update(ctx, trainingRuntime)).To(gomega.Succeed())
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), runtimeName).
+						Trainer(&trainer.Trainer{Env: []corev1.EnvVar{{Name: "PET_NODE_RANK", Value: "1"}}}).
+						Obj()
+				},
+				testingutil.BeForbiddenError()),
+
+			ginkgo.Entry("Should fail in creating TrainJob with Flux numProcPerNode < 1",
+				func() *trainer.TrainJob {
+					trainingRuntime.Spec.MLPolicy = &trainer.MLPolicy{
+						MLPolicySource: trainer.MLPolicySource{
+							Flux: &trainer.FluxMLPolicySource{},
+						},
+					}
+					gomega.Expect(k8sClient.Update(ctx, trainingRuntime)).To(gomega.Succeed())
+
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(
+							trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind),
+							runtimeName,
+						).
+						Trainer(&trainer.Trainer{
+							NumProcPerNode: ptr.To[int32](0),
+						}).
+						Obj()
+				},
+				// numProcPerNode: 0 is rejected by the CRD schema before the Flux
+				// plugin webhook runs, so the error is Invalid, not Forbidden.
+				testingutil.BeInvalidError(),
+			),
+			ginkgo.Entry("Should fail in creating TrainJob with reserved flux-installer init container",
+				func() *trainer.TrainJob {
+					trainingRuntime.Spec.MLPolicy = &trainer.MLPolicy{
+						MLPolicySource: trainer.MLPolicySource{
+							Flux: &trainer.FluxMLPolicySource{},
+						},
+					}
+					trainingRuntime.Spec = testingutil.MakeTrainingRuntimeSpecWrapper(trainingRuntime.Spec).
+						InitContainer(constants.Node, constants.FluxInstallerContainerName, "ubuntu:22.04").
+						Obj()
+
+					gomega.Expect(k8sClient.Update(ctx, trainingRuntime)).To(gomega.Succeed())
+
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(
+							trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind),
+							runtimeName,
+						).
+						Obj()
+				},
+				testingutil.BeForbiddenError(),
+			),
+			ginkgo.Entry("Should fail with invalid dataset storageUri",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Initializer(
+							testingutil.MakeTrainJobInitializerWrapper().
+								DatasetInitializer(
+									testingutil.MakeTrainJobDatasetInitializerWrapper().
+										StorageUri("invalid-uri").
+										Obj(),
+								).
+								Obj(),
+						).
+						Obj()
+				},
+				testingutil.BeInvalidError(),
+			),
+			ginkgo.Entry("Should succeed with empty dataset storageUri",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Initializer(
+							testingutil.MakeTrainJobInitializerWrapper().
+								DatasetInitializer(
+									testingutil.MakeTrainJobDatasetInitializerWrapper().
+										StorageUri("").
+										Obj(),
+								).
+								Obj(),
+						).
+						Obj()
+				},
+				gomega.Succeed(),
+			),
+			ginkgo.Entry("Should fail with dataset storageUri missing path",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Initializer(
+							testingutil.MakeTrainJobInitializerWrapper().
+								DatasetInitializer(
+									testingutil.MakeTrainJobDatasetInitializerWrapper().
+										StorageUri("s3://").
+										Obj(),
+								).
+								Obj(),
+						).
+						Obj()
+				},
+				testingutil.BeInvalidError(),
+			),
+			ginkgo.Entry("Should succeed with valid dataset storageUri",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Initializer(
+							testingutil.MakeTrainJobInitializerWrapper().
+								DatasetInitializer(
+									testingutil.MakeTrainJobDatasetInitializerWrapper().
+										StorageUri("s3://bucket/path").
+										Obj(),
+								).
+								Obj(),
+						).
+						Obj()
+				},
+				gomega.Succeed(),
+			),
+			ginkgo.Entry("Should fail with invalid model storageUri",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Initializer(
+							testingutil.MakeTrainJobInitializerWrapper().
+								ModelInitializer(
+									testingutil.MakeTrainJobModelInitializerWrapper().
+										StorageUri("invalid-uri").
+										Obj(),
+								).
+								Obj(),
+						).
+						Obj()
+				},
+				testingutil.BeInvalidError(),
+			),
+
+			ginkgo.Entry("Should succeed with valid model storageUri",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Initializer(
+							testingutil.MakeTrainJobInitializerWrapper().
+								ModelInitializer(
+									testingutil.MakeTrainJobModelInitializerWrapper().
+										StorageUri("gs://bucket/model").
+										Obj(),
+								).
+								Obj(),
+						).
+						Obj()
+				},
+				gomega.Succeed(),
+			),
+			ginkgo.Entry("Should succeed to create TrainJob with trainer command item at the max length",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Trainer(&trainer.Trainer{
+							Command: []string{strings.Repeat("a", 1048576)},
+						}).
+						Obj()
+				},
+				gomega.Succeed(),
+			),
+			ginkgo.Entry("Should fail to create TrainJob with trainer command item exceeding the max length",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Trainer(&trainer.Trainer{
+							Command: []string{strings.Repeat("a", 1048576+1)},
+						}).
+						Obj()
+				},
+				testingutil.BeInvalidError(),
+			),
+			ginkgo.Entry("Should succeed to create TrainJob with trainer args item at the max length",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Trainer(&trainer.Trainer{
+							Args: []string{strings.Repeat("a", 1048576)},
+						}).
+						Obj()
+				},
+				gomega.Succeed(),
+			),
+			ginkgo.Entry("Should fail to create TrainJob with trainer args item exceeding the max length",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, jobName).
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Trainer(&trainer.Trainer{
+							Args: []string{strings.Repeat("a", 1048576+1)},
+						}).
+						Obj()
+				},
+				testingutil.BeInvalidError(),
+			),
+		)
+		ginkgo.DescribeTable("RFC1035-compliant TrainJob name validation", func(trainJob func() *trainer.TrainJob, errorMatcher gomega.OmegaMatcher) {
+			gomega.Expect(k8sClient.Create(ctx, trainJob())).Should(errorMatcher)
+		},
+			ginkgo.Entry("Should succeed to create TrainJob with valid RFC1035-compliant name",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "valid-job-name").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should succeed to create TrainJob with name at maximum allowed length for runtime",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name,
+						strings.Repeat("a", 33)). // 33 chars: max length for dataset-initializer
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to create TrainJob with name exceeding maximum allowed length for runtime",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name,
+						strings.Repeat("a", 34)). // 34 chars: exceeds 33 max length for dataset-initializer
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Obj()
+				},
+				testingutil.BeForbiddenError()),
+			ginkgo.Entry("Should fail to create TrainJob with uppercase letters in name",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "Invalid-job-name").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should fail to create TrainJob starting with a digit",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "1jobname").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should fail to create TrainJob ending with a hyphen",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "jobname-").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should fail to create TrainJob with name exceeding 63 characters",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name,
+						"this-name-is-way-too-long-for-a-rfc1035-label-and-should-fail-validation").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), runtimeName).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+		)
+	})
+})
+
+var _ = ginkgo.Describe("TrainJob marker validations and defaulting", ginkgo.Ordered, func() {
+	var ns *corev1.Namespace
+	var (
+		trainingRuntime        *trainer.TrainingRuntime
+		clusterTrainingRuntime *trainer.ClusterTrainingRuntime
+	)
+
+	ginkgo.BeforeAll(func() {
+		fwk = &framework.Framework{}
+		cfg = fwk.Init()
+		ctx, k8sClient = fwk.RunManager(cfg, false)
+	})
+	ginkgo.AfterAll(func() {
+		fwk.Teardown()
+	})
+
+	ginkgo.BeforeEach(func() {
+		ns = &corev1.Namespace{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: corev1.SchemeGroupVersion.String(),
+				Kind:       "Namespace",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				GenerateName: "trainjob-marker-",
+			},
+		}
+		gomega.Expect(k8sClient.Create(ctx, ns)).To(gomega.Succeed())
+		baseRuntimeWrapper := testingutil.MakeTrainingRuntimeWrapper(ns.Name, "testing")
+		baseClusterRuntimeWrapper := testingutil.MakeClusterTrainingRuntimeWrapper("testing")
+		trainingRuntime = baseRuntimeWrapper.RuntimeSpec(
+			testingutil.MakeTrainingRuntimeSpecWrapper(
+				testingutil.MakeTrainingRuntimeWrapper(ns.Name, "testing").Spec).Obj()).Obj()
+		clusterTrainingRuntime = baseClusterRuntimeWrapper.RuntimeSpec(
+			testingutil.MakeTrainingRuntimeSpecWrapper(
+				testingutil.MakeClusterTrainingRuntimeWrapper("testing").Spec).Obj()).Obj()
+		gomega.Expect(k8sClient.Create(ctx, trainingRuntime)).To(gomega.Succeed())
+		gomega.Expect(k8sClient.Create(ctx, clusterTrainingRuntime)).To(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(trainingRuntime), trainingRuntime)).Should(gomega.Succeed())
+		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		gomega.Eventually(func(g gomega.Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(clusterTrainingRuntime), clusterTrainingRuntime)).Should(gomega.Succeed())
+		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	})
+	ginkgo.AfterAll(func() {
+		fwk.Teardown()
+	})
+
+	ginkgo.AfterEach(func() {
+		gomega.Expect(k8sClient.DeleteAllOf(ctx, &trainer.TrainJob{}, client.InNamespace(ns.Name))).Should(gomega.Succeed())
+		gomega.Expect(k8sClient.DeleteAllOf(ctx, &trainer.TrainingRuntime{}, client.InNamespace(ns.Name))).To(gomega.Succeed())
+		gomega.Expect(k8sClient.DeleteAllOf(ctx, &trainer.ClusterTrainingRuntime{})).To(gomega.Succeed())
+	})
+
+	ginkgo.When("Creating TrainJob", func() {
+		ginkgo.DescribeTable("Validate TrainJob on creation", func(trainJob func() *trainer.TrainJob, errorMatcher gomega.OmegaMatcher) {
+			gomega.Expect(k8sClient.Create(ctx, trainJob())).Should(errorMatcher)
+		},
+			ginkgo.Entry("Should succeed to create TrainJob with 'managedBy: trainer.kubeflow.org/trainjob-controller'",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "managed-by-trainjob-controller").
+						ManagedBy("trainer.kubeflow.org/trainjob-controller").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should succeed to create TrainJob with 'managedBy: kueue.x-k8s.io/multukueue'",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "managed-by-trainjob-controller").
+						ManagedBy("kueue.x-k8s.io/multikueue").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to create TrainJob with invalid managedBy",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "invalid-managed-by").
+						ManagedBy("invalid").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should succeed to create trainJob with runtimePatches containing two replicated job patches",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "two-rjob-patches").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						RuntimePatches([]trainer.RuntimePatch{
+							{
+								Manager: "acme.io/manager-one",
+								TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+									Template: &trainer.JobSetTemplatePatch{
+										Spec: &trainer.JobSetSpecPatch{
+											ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+												Name: "node",
+												Template: &trainer.JobTemplatePatch{
+													Spec: &trainer.JobSpecPatch{
+														Template: &trainer.PodTemplatePatch{
+															Spec: &trainer.PodSpecPatch{
+																ServiceAccountName: ptr.To("custom-sa"),
+															},
+														},
+													},
+												},
+											}},
+										},
+									},
+								},
+							},
+							{
+								Manager: "acme.io/manager-two",
+								TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+									Template: &trainer.JobSetTemplatePatch{
+										Spec: &trainer.JobSetSpecPatch{
+											ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+												Name: "node",
+												Template: &trainer.JobTemplatePatch{
+													Spec: &trainer.JobSpecPatch{
+														Template: &trainer.PodTemplatePatch{
+															Spec: &trainer.PodSpecPatch{
+																ServiceAccountName: ptr.To("custom-sa-two"),
+															},
+														},
+													},
+												},
+											}},
+										},
+									},
+								},
+							},
+						}).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should succeed to create trainJob with valid RuntimePatches manager",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "valid-runtimepatches-manager").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						RuntimePatches([]trainer.RuntimePatch{
+							{
+								Manager: "kueue.k8s.io/manager",
+							},
+						}).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to create trainJob with invalid RuntimePatches manager",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "invalid-runtimepatches-manager").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						RuntimePatches([]trainer.RuntimePatch{
+							{
+								Manager: "kueue.k8s.io/",
+							},
+						}).
+						Obj()
+				},
+				testingutil.BeForbiddenError()),
+			ginkgo.Entry("Should succeed to create TrainJob with valid terminationGracePeriodSeconds in RuntimePatches",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "valid-termination-grace-period").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						RuntimePatches([]trainer.RuntimePatch{
+							{
+								Manager: "acme.io/manager",
+								TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+									Template: &trainer.JobSetTemplatePatch{
+										Spec: &trainer.JobSetSpecPatch{
+											ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+												Name: constants.Node,
+												Template: &trainer.JobTemplatePatch{
+													Spec: &trainer.JobSpecPatch{
+														Template: &trainer.PodTemplatePatch{
+															Spec: &trainer.PodSpecPatch{
+																TerminationGracePeriodSeconds: ptr.To(int64(300)),
+															},
+														},
+													},
+												},
+											}},
+										},
+									},
+								},
+							},
+						}).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to create TrainJob with negative terminationGracePeriodSeconds",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "invalid-termination-grace-period").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						RuntimePatches([]trainer.RuntimePatch{
+							{
+								Manager: "acme.io/manager",
+								TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+									Template: &trainer.JobSetTemplatePatch{
+										Spec: &trainer.JobSetSpecPatch{
+											ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+												Name: constants.Node,
+												Template: &trainer.JobTemplatePatch{
+													Spec: &trainer.JobSpecPatch{
+														Template: &trainer.PodTemplatePatch{
+															Spec: &trainer.PodSpecPatch{
+																TerminationGracePeriodSeconds: ptr.To(int64(-1)),
+															},
+														},
+													},
+												},
+											}},
+										},
+									},
+								},
+							},
+						}).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should succeed to create TrainJob with zero terminationGracePeriodSeconds",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "zero-termination-grace-period").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						RuntimePatches([]trainer.RuntimePatch{
+							{
+								Manager: "acme.io/manager",
+								TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+									Template: &trainer.JobSetTemplatePatch{
+										Spec: &trainer.JobSetSpecPatch{
+											ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+												Name: constants.Node,
+												Template: &trainer.JobTemplatePatch{
+													Spec: &trainer.JobSpecPatch{
+														Template: &trainer.PodTemplatePatch{
+															Spec: &trainer.PodSpecPatch{
+																TerminationGracePeriodSeconds: ptr.To(int64(0)),
+															},
+														},
+													},
+												},
+											}},
+										},
+									},
+								},
+							},
+						}).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to create TrainJob with claims in resourcesPerNode",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "claims-in-resources-per-node").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Trainer(&trainer.Trainer{
+							ResourcesPerNode: &corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "gpu"}}},
+						}).
+						Obj()
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Rejects creating a TrainJob with a runtimePatches container resources.claim that does not exist in the pod resourceClaims",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "dangling-container-claim").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						RuntimePatches([]trainer.RuntimePatch{
+							{
+								Manager: "acme.io/manager",
+								TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+									Template: &trainer.JobSetTemplatePatch{
+										Spec: &trainer.JobSetSpecPatch{
+											ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+												Name: constants.Node,
+												Template: &trainer.JobTemplatePatch{
+													Spec: &trainer.JobSpecPatch{
+														Template: &trainer.PodTemplatePatch{
+															Spec: &trainer.PodSpecPatch{
+																Containers: []trainer.ContainerPatch{{
+																	Name: constants.Node,
+																	Resources: &corev1.ResourceRequirements{
+																		Claims: []corev1.ResourceClaim{{Name: "dangling"}},
+																	},
+																}},
+															},
+														},
+													},
+												},
+											}},
+										},
+									},
+								},
+							},
+						}).
+						Obj()
+				},
+				gomega.MatchError(gomega.ContainSubstring("references resourceClaim \"dangling\" which is not defined in the Pod's resourceClaims"))),
+			ginkgo.Entry("Should succeed to create TrainJob with resourceClaimsPerNode",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "resource-claims-per-node").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Trainer(
+							testingutil.MakeTrainJobTrainerWrapper().
+								ResourceClaimsPerNode(trainer.TrainerResourceClaim{Name: "gpu", ResourceClaimTemplateName: "gpu-template"}).
+								Obj()).
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should succeed to create TrainJob with a runtimePatches resourceClaim consumed by a container",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "runtime-patches-resource-claim").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						RuntimePatches([]trainer.RuntimePatch{
+							{
+								Manager: "acme.io/manager",
+								TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+									Template: &trainer.JobSetTemplatePatch{
+										Spec: &trainer.JobSetSpecPatch{
+											ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+												Name: constants.Node,
+												Template: &trainer.JobTemplatePatch{
+													Spec: &trainer.JobSpecPatch{
+														Template: &trainer.PodTemplatePatch{
+															Spec: &trainer.PodSpecPatch{
+																ResourceClaims: []corev1.PodResourceClaim{{
+																	Name:                      "gpu",
+																	ResourceClaimTemplateName: ptr.To("gpu-template"),
+																}},
+																Containers: []trainer.ContainerPatch{{
+																	Name: constants.Node,
+																	Resources: &corev1.ResourceRequirements{
+																		Claims: []corev1.ResourceClaim{{Name: "gpu"}},
+																	},
+																}},
+															},
+														},
+													},
+												},
+											}},
+										},
+									},
+								},
+							},
+						}).
+						Obj()
+				},
+				gomega.Succeed()),
+		)
+		ginkgo.DescribeTable("Defaulting TrainJob on creation", func(trainJob func() *trainer.TrainJob, wantTrainJob func() *trainer.TrainJob) {
+			created := trainJob()
+			gomega.Expect(k8sClient.Create(ctx, created)).Should(gomega.Succeed())
+			gomega.Expect(created).Should(gomega.BeComparableTo(wantTrainJob(), util.IgnoreObjectMetadata))
+		},
+			ginkgo.Entry("Should succeed to default suspend=false",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "null-suspend").
+						ManagedBy("kueue.x-k8s.io/multikueue").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), "testing").
+						Obj()
+				},
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "null-suspend").
+						ManagedBy("kueue.x-k8s.io/multikueue").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), "testing").
+						Suspend(false).
+						Obj()
+				}),
+			ginkgo.Entry("Should succeed to default managedBy=trainer.kubeflow.org/trainjob-controller",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "null-managed-by").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Suspend(true).
+						Obj()
+				},
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "null-managed-by").
+						ManagedBy("trainer.kubeflow.org/trainjob-controller").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Suspend(true).
+						Obj()
+				}),
+			ginkgo.Entry("Should succeed to default runtimeRef.apiGroup",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "empty-api-group").
+						RuntimeRef(schema.GroupVersionKind{Group: "", Version: "", Kind: trainer.TrainingRuntimeKind}, "testing").
+						Obj()
+				},
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "empty-api-group").
+						ManagedBy("trainer.kubeflow.org/trainjob-controller").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Suspend(false).
+						Obj()
+				}),
+			ginkgo.Entry("Should succeed to default runtimeRef.kind",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "empty-kind").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(""), "testing").
+						Obj()
+				},
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "empty-kind").
+						ManagedBy("trainer.kubeflow.org/trainjob-controller").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.ClusterTrainingRuntimeKind), "testing").
+						Suspend(false).
+						Obj()
+				}),
+		)
+	})
+
+	ginkgo.When("Creating TrainJob with a runtime which sets Job-level resourceClaims", func() {
+		ginkgo.BeforeEach(func() {
+			baseRuntime := testingutil.MakeTrainingRuntimeWrapper(ns.Name, "testing-was")
+			wasRuntime := baseRuntime.RuntimeSpec(testingutil.MakeTrainingRuntimeSpecWrapper(baseRuntime.Spec).
+				PodResourceClaims(constants.Node, corev1.PodResourceClaim{Name: "tpu-slice", ResourceClaimTemplateName: ptr.To("tpu-slice-template")}).
+				Scheduling(&trainer.TrainingRuntimeScheduling{
+					ReplicatedJobs: []trainer.ReplicatedJobScheduling{
+						{TargetReplicatedJobs: []string{constants.DatasetInitializer, constants.ModelInitializer}},
+						{
+							TargetReplicatedJobs: []string{constants.Node},
+							Job: &trainer.JobScheduling{
+								ResourceClaims: []schedulingv1alpha3.WorkloadPodGroupResourceClaim{{
+									Name:                      "tpu-slice",
+									ResourceClaimTemplateName: ptr.To("tpu-slice-template"),
+								}},
+							},
+						},
+					},
+				}).
+				Obj()).
+				Obj()
+			gomega.Expect(k8sClient.Create(ctx, wasRuntime)).To(gomega.Succeed())
+		})
+		ginkgo.DescribeTable("Validate TrainJob on creation", func(trainJob func() *trainer.TrainJob, errorMatcher gomega.OmegaMatcher) {
+			gomega.Expect(k8sClient.Create(ctx, trainJob())).Should(errorMatcher)
+		},
+			ginkgo.Entry("Should succeed to create TrainJob without resource claims",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "no-resource-claims").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing-was").
+						Obj()
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to create TrainJob with resourceClaimsPerNode",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "resource-claims-per-node").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing-was").
+						Trainer(
+							testingutil.MakeTrainJobTrainerWrapper().
+								ResourceClaimsPerNode(trainer.TrainerResourceClaim{Name: "gpu", ResourceClaimTemplateName: "gpu-template"}).
+								Obj()).
+						Obj()
+				},
+				gomega.MatchError(gomega.ContainSubstring("must not be set when the runtime sets spec.scheduling.replicatedJobs[].job.resourceClaims"))),
+			ginkgo.Entry("Should fail to create TrainJob with runtimePatches Pod resourceClaims",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "runtime-patches-resource-claims").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing-was").
+						RuntimePatches([]trainer.RuntimePatch{{
+							Manager: "acme.io/manager",
+							TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+								Template: &trainer.JobSetTemplatePatch{
+									Spec: &trainer.JobSetSpecPatch{
+										ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+											Name: constants.Node,
+											Template: &trainer.JobTemplatePatch{
+												Spec: &trainer.JobSpecPatch{
+													Template: &trainer.PodTemplatePatch{
+														Spec: &trainer.PodSpecPatch{
+															ResourceClaims: []corev1.PodResourceClaim{{
+																Name:                      "gpu",
+																ResourceClaimTemplateName: ptr.To("gpu-template"),
+															}},
+														},
+													},
+												},
+											},
+										}},
+									},
+								},
+							},
+						}}).
+						Obj()
+				},
+				gomega.MatchError(gomega.ContainSubstring("must not be set when the runtime sets spec.scheduling.replicatedJobs[].job.resourceClaims"))),
+		)
+	})
+
+	ginkgo.When("Defaulting RuntimePatch.Time on creation", func() {
+		ginkgo.It("Should set Time on each RuntimePatch when creating a TrainJob", func() {
+			trainJob := testingutil.MakeTrainJobWrapper(ns.Name, "time-defaulting").
+				RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+				RuntimePatches([]trainer.RuntimePatch{
+					{Manager: "acme.io/manager-one"},
+					{Manager: "acme.io/manager-two"},
+				}).
+				Obj()
+			gomega.Expect(k8sClient.Create(ctx, trainJob)).Should(gomega.Succeed())
+			gomega.Eventually(func(g gomega.Gomega) {
+				got := &trainer.TrainJob{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(trainJob), got)).Should(gomega.Succeed())
+				g.Expect(got.Spec.RuntimePatches).Should(gomega.HaveLen(2))
+				g.Expect(got.Spec.RuntimePatches[0].Time).ShouldNot(gomega.BeNil())
+				g.Expect(got.Spec.RuntimePatches[1].Time).ShouldNot(gomega.BeNil())
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		})
+	})
+
+	ginkgo.When("Updating TrainJob", func() {
+		ginkgo.DescribeTable("Validate TrainJob on update", func(old func() *trainer.TrainJob, new func(*trainer.TrainJob) *trainer.TrainJob, errorMatcher gomega.OmegaMatcher) {
+			oldTrainJob := old()
+			gomega.Expect(k8sClient.Create(ctx, oldTrainJob)).Should(gomega.Succeed())
+			gomega.Eventually(func(g gomega.Gomega) {
+				g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(oldTrainJob), oldTrainJob)).Should(gomega.Succeed())
+				g.Expect(k8sClient.Update(ctx, new(oldTrainJob))).Should(errorMatcher)
+			}, util.Timeout, util.Interval).Should(gomega.Succeed())
+		},
+			ginkgo.Entry("Should fail to update managedBy",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "valid-managed-by").
+						ManagedBy("trainer.kubeflow.org/trainjob-controller").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Obj()
+				},
+				func(job *trainer.TrainJob) *trainer.TrainJob {
+					job.Spec.ManagedBy = ptr.To("kueue.x-k8s.io/multikueue")
+					return job
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should fail to update runtimeRef",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "valid-runtimeref").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Obj()
+				},
+				func(job *trainer.TrainJob) *trainer.TrainJob {
+					job.Spec.RuntimeRef.Name = "forbidden-update"
+					return job
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should fail to update initializer",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "valid-initializer").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Initializer(&trainer.Initializer{
+							Model: &trainer.ModelInitializer{
+								StorageUri: ptr.To("s3://test/path"),
+							},
+						}).
+						Obj()
+				},
+				func(job *trainer.TrainJob) *trainer.TrainJob {
+					job.Spec.Initializer.Model.StorageUri = ptr.To("s3://forbidden-update")
+					return job
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should fail to update trainer",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "valid-trainer").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Trainer(&trainer.Trainer{
+							Image: ptr.To("test-image"),
+						}).
+						Obj()
+				},
+				func(job *trainer.TrainJob) *trainer.TrainJob {
+					job.Spec.Trainer.Image = ptr.To("forbidden-update")
+					return job
+				},
+				testingutil.BeInvalidError()),
+			ginkgo.Entry("Should succeed to update runtimePatches when suspend is true",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "valid-runtimepatches").
+						RuntimeRef(trainer.SchemeGroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						Suspend(true).
+						RuntimePatches([]trainer.RuntimePatch{
+							{
+								Manager: "test.io/manager",
+								TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+									Template: &trainer.JobSetTemplatePatch{
+										Spec: &trainer.JobSetSpecPatch{
+											ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+												Name: "node",
+												Template: &trainer.JobTemplatePatch{
+													Spec: &trainer.JobSpecPatch{
+														Template: &trainer.PodTemplatePatch{
+															Spec: &trainer.PodSpecPatch{
+																NodeSelector: map[string]string{"test": "test"},
+															},
+														},
+													},
+												},
+											}},
+										},
+									},
+								},
+							},
+						}).
+						Obj()
+				},
+				func(job *trainer.TrainJob) *trainer.TrainJob {
+					job.Spec.RuntimePatches[0].TrainingRuntimeSpec.Template.Spec.ReplicatedJobs[0].Template.Spec.Template.Spec.NodeSelector = map[string]string{"allow": "update"}
+					return job
+				},
+				gomega.Succeed()),
+			ginkgo.Entry("Should fail to update TrainJob terminationGracePeriodSeconds after creation",
+				func() *trainer.TrainJob {
+					return testingutil.MakeTrainJobWrapper(ns.Name, "immutable-term-grace-period").
+						RuntimeRef(trainer.GroupVersion.WithKind(trainer.TrainingRuntimeKind), "testing").
+						RuntimePatches([]trainer.RuntimePatch{
+							{
+								Manager: "acme.io/manager",
+								TrainingRuntimeSpec: &trainer.TrainingRuntimeSpecPatch{
+									Template: &trainer.JobSetTemplatePatch{
+										Spec: &trainer.JobSetSpecPatch{
+											ReplicatedJobs: []trainer.ReplicatedJobPatch{{
+												Name: constants.Node,
+												Template: &trainer.JobTemplatePatch{
+													Spec: &trainer.JobSpecPatch{
+														Template: &trainer.PodTemplatePatch{
+															Spec: &trainer.PodSpecPatch{
+																TerminationGracePeriodSeconds: ptr.To(int64(300)),
+															},
+														},
+													},
+												},
+											}},
+										},
+									},
+								},
+							},
+						}).
+						Obj()
+				},
+				func(job *trainer.TrainJob) *trainer.TrainJob {
+					job.Spec.RuntimePatches[0].TrainingRuntimeSpec.Template.Spec.ReplicatedJobs[0].Template.Spec.Template.Spec.TerminationGracePeriodSeconds = ptr.To(int64(600))
+					return job
+				},
+				testingutil.BeInvalidError()),
+		)
+	})
+})
